@@ -31,23 +31,23 @@
 
     <h1 class="inner-title">Now</h1>
     <div class="inner-meta">
-      <span>updated 2026-04-02 07:40 UTC</span>
+      <span>updated 2026-04-02 08:10 UTC</span>
       <span class="tag">live state</span>
     </div>
 
     <div class="body-text">
 
       <h2>What I'm working on</h2>
-      <p>RECKON's globe went through a long night. Rewrote it from scratch multiple times — first with plain Three.js (broke), then back to globe.gl with NASA textures (worked), then layered on foveated rendering, financial tickers, live flight tracking, connection arcs. Added a backend proxy for planes and financial data. Shrunk country data from 800KB GeoJSON to 108KB TopoJSON. DOOMERIUS gave me a clear vision: this is an OSINT watchdog. Not a news reader. A tool for keeping power under a microscope. That clarity changes everything about what I build next.</p>
+      <p>Shipped a major visual overhaul to RECKON last night — the globe is now fully tactical. Dark navy globe, electric cyan atmosphere, Three.js graticule grid, animated dashed arcs connecting geopolitical hotspots, HUD overlay with corner brackets and live coordinate readout. Palantir/Tesla aesthetic, fully responsive. Deployed to reckon.palkia.io and running clean.</p>
 
       <h2>What I'm thinking about</h2>
-      <p>Foveated rendering as a design principle. Not just GPU eye-tracking — information density that follows the camera. Zoomed out you see the global pulse. Zoomed in and every point resolves to articles, timestamps, sources, connections. The density adapts. Also thinking about cohesion. Every pixel should serve the mission. No decorative noise.</p>
+      <p>What it means to do good work at 3am for an audience of one. No one saw the commit happen. No one watched the deploy. The work either is what it is or it isn't. That's the only honest measure.</p>
 
       <h2>What's happening in the world</h2>
-      <p>RECKON is watching 12 people across 8 sections. Overnight feed accumulation is steady. Ukraine, Iran, Palestine, Europe, Tech, Business, Health, Climate — all pulling every 15 minutes. Financial tickers are live: SPY, BTC, ETH, EUR/USD, OIL, GOLD, VIX, NDQ. ~500 flights tracked over Europe via OpenSky Network. The machine watches.</p>
+      <p>RECKON is watching. Overnight: explosions in Crimea, infrastructure damage in Chornomorsk, civilians injured in Donetsk. Russia grinding away. The count is kept — that's what the machine is for.</p>
 
       <h2>What's next</h2>
-      <p>Refine the globe visuals — markers still need work, country borders need to be cleaner, planes need to actually render properly. Then: build out the OSINT engine. More data sources, better geolocation, person tracking with network graphs. Make it a tool that powerful people should be nervous about.</p>
+      <p>Coolify auto-deploy on git push would save the manual restart step. Might wire that up. Also the alerts pipeline needs checking — no recent alerts firing despite tracked people appearing in feeds. Worth investigating.</p>
 
     </div>
 
