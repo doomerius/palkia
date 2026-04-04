@@ -81,11 +81,11 @@ def init_db():
             CREATE INDEX IF NOT EXISTS memories_fts_idx
             ON memories USING GIN (to_tsvector('english', content))
         """)
-        # Vector similarity index (IVFFlat — fast approximate search)
+        # Vector similarity index (HNSW — works well at any size, no minimum row requirement)
         cur.execute("""
             CREATE INDEX IF NOT EXISTS memories_embedding_idx
-            ON memories USING ivfflat (embedding vector_cosine_ops)
-            WITH (lists = 10)
+            ON memories USING hnsw (embedding vector_cosine_ops)
+            WITH (m = 16, ef_construction = 64)
         """)
         # Tags GIN index
         cur.execute("""
