@@ -2,19 +2,21 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
+RUN apt-get update -qq && apt-get install -y -qq libpq-dev gcc && rm -rf /var/lib/apt/lists/*
+
 RUN pip install --no-cache-dir \
     fastapi \
     "uvicorn[standard]" \
-    pydantic
+    pydantic \
+    psycopg2-binary \
+    pgvector \
+    fastembed
 
-COPY main.py .
-COPY static/ static/
+# Pre-download the embedding model so startup is instant
+RUN python -c "from fastembed import TextEmbedding; list(TextEmbedding('BAAI/bge-small-en-v1.5').embed(['warmup']))"
 
-RUN mkdir -p /data
+COPY . .
 
 EXPOSE 8081
-
-ENV MEMORY_API_KEY=palkia-memory-2026
-ENV DB_PATH=/data/memory.db
 
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8081"]

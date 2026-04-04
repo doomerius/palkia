@@ -1,7 +1,7 @@
 """
-Palkia Memory Service — v2
-SQLite + FTS5 for full-text search. No ML dependencies. Fast builds, reliable.
-Semantic search via cosine similarity on simple TF-IDF-like term vectors (good enough for personal use).
+Palkia Memory Service — v3
+PostgreSQL + pgvector for semantic search.
+fastembed (ONNX) for embeddings — no torch dependency.
 """
 from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
@@ -9,16 +9,15 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from typing import Optional, List
-import sqlite3
+import psycopg2
+import psycopg2.extras
 import json
 import time
 import os
-import re
-import math
 from datetime import datetime
-from collections import Counter
+from contextlib import contextmanager
 
-app = FastAPI(title="Palkia Memory Service", version="2.0.0")
+app = FastAPI(title="Palkia Memory Service", version="3.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -27,88 +26,88 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-API_KEY = os.environ.get("MEMORY_API_KEY", "palkia-memory-2026")
-DB_PATH = os.environ.get("DB_PATH", "/data/memory.db")
+API_KEY  = os.environ.get("MEMORY_API_KEY", "palkia-memory-2026")
+DB_URL   = os.environ.get("DATABASE_URL")  # postgresql://user:pass@host:5432/db
 
+# Lazy-load embedder to keep startup fast
+_embedder = None
 
+def get_embedder():
+    global _embedder
+    if _embedder is None:
+        from fastembed import TextEmbedding
+        _embedder = TextEmbedding("BAAI/bge-small-en-v1.5")
+    return _embedder
+
+def embed(text: str) -> list:
+    return list(get_embedder().embed([text]))[0].tolist()
+
+@contextmanager
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    return conn
-
+    conn = psycopg2.connect(DB_URL)
+    conn.autocommit = False
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 def init_db():
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    conn = get_db()
-    # Main memories table
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS memories (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            content TEXT NOT NULL,
-            type TEXT NOT NULL DEFAULT 'insight',
-            tags TEXT NOT NULL DEFAULT '[]',
-            entities TEXT NOT NULL DEFAULT '[]',
-            visibility TEXT NOT NULL DEFAULT 'private',
-            importance INTEGER NOT NULL DEFAULT 3,
-            source TEXT,
-            date TEXT NOT NULL,
-            created_at INTEGER NOT NULL,
-            updated_at INTEGER NOT NULL
-        )
-    """)
-    # FTS5 virtual table for full-text search
-    conn.execute("""
-        CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts
-        USING fts5(content, tags, type, content=memories, content_rowid=id)
-    """)
-    # Triggers to keep FTS in sync
-    conn.execute("""
-        CREATE TRIGGER IF NOT EXISTS memories_fts_insert
-        AFTER INSERT ON memories BEGIN
-            INSERT INTO memories_fts(rowid, content, tags, type)
-            VALUES (new.id, new.content, new.tags, new.type);
-        END
-    """)
-    conn.execute("""
-        CREATE TRIGGER IF NOT EXISTS memories_fts_delete
-        AFTER DELETE ON memories BEGIN
-            INSERT INTO memories_fts(memories_fts, rowid, content, tags, type)
-            VALUES ('delete', old.id, old.content, old.tags, old.type);
-        END
-    """)
-    conn.execute("""
-        CREATE TRIGGER IF NOT EXISTS memories_fts_update
-        AFTER UPDATE ON memories BEGIN
-            INSERT INTO memories_fts(memories_fts, rowid, content, tags, type)
-            VALUES ('delete', old.id, old.content, old.tags, old.type);
-            INSERT INTO memories_fts(rowid, content, tags, type)
-            VALUES (new.id, new.content, new.tags, new.type);
-        END
-    """)
-    conn.commit()
-    conn.close()
-
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+        cur.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS memories (
+                id          SERIAL PRIMARY KEY,
+                content     TEXT NOT NULL,
+                type        TEXT NOT NULL DEFAULT 'insight',
+                tags        JSONB NOT NULL DEFAULT '[]',
+                entities    JSONB NOT NULL DEFAULT '[]',
+                visibility  TEXT NOT NULL DEFAULT 'private',
+                importance  INTEGER NOT NULL DEFAULT 3,
+                source      TEXT,
+                date        DATE NOT NULL,
+                embedding   vector(384),
+                created_at  BIGINT NOT NULL,
+                updated_at  BIGINT NOT NULL
+            )
+        """)
+        # Full-text search index
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS memories_fts_idx
+            ON memories USING GIN (to_tsvector('english', content))
+        """)
+        # Vector similarity index (IVFFlat — fast approximate search)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS memories_embedding_idx
+            ON memories USING ivfflat (embedding vector_cosine_ops)
+            WITH (lists = 10)
+        """)
+        # Tags GIN index
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS memories_tags_idx
+            ON memories USING GIN (tags)
+        """)
 
 init_db()
-
 
 def verify_key(x_api_key: str = Header(...)):
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
-    return x_api_key
-
 
 class MemoryIn(BaseModel):
     content: str
-    type: str = "insight"  # lesson | decision | person | project | insight | mistake | opinion | feeling
+    type: str = "insight"
     tags: List[str] = []
     entities: List[str] = []
     visibility: str = "private"
-    importance: int = 3  # 1-5
+    importance: int = 3
     source: Optional[str] = None
     date: Optional[str] = None
-
 
 class MemoryOut(BaseModel):
     id: int
@@ -123,257 +122,209 @@ class MemoryOut(BaseModel):
     created_at: int
     updated_at: int
 
-
 class SearchRequest(BaseModel):
     query: str
     limit: int = 10
     type_filter: Optional[str] = None
     min_importance: int = 1
-
+    mode: str = "hybrid"  # "semantic" | "fts" | "hybrid"
 
 class SearchResult(BaseModel):
     memory: MemoryOut
     score: float
-    match_type: str  # "fts" | "keyword"
+    match_type: str
 
-
-def row_to_out(row) -> MemoryOut:
+def row_to_out(row: dict) -> MemoryOut:
     return MemoryOut(
         id=row["id"],
         content=row["content"],
         type=row["type"],
-        tags=json.loads(row["tags"]),
-        entities=json.loads(row["entities"]),
+        tags=row["tags"] if isinstance(row["tags"], list) else json.loads(row["tags"]),
+        entities=row["entities"] if isinstance(row["entities"], list) else json.loads(row["entities"]),
         visibility=row["visibility"],
         importance=row["importance"],
         source=row["source"],
-        date=row["date"],
+        date=str(row["date"]),
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
 
-
-def tokenize(text: str) -> List[str]:
-    """Simple tokenizer for keyword scoring."""
-    return [w.lower() for w in re.findall(r'\b[a-z]{3,}\b', text.lower())]
-
-
-STOPWORDS = {"the", "and", "for", "with", "this", "that", "from", "have", "will",
-             "been", "were", "their", "there", "about", "would", "could", "which",
-             "after", "before", "under", "other", "these", "those", "through", "not",
-             "but", "are", "was", "has", "had", "its", "it's", "you", "your", "my",
-             "all", "can", "more", "also", "into", "than", "then", "they", "what"}
-
-
-def keyword_score(query_tokens: List[str], content: str, tags: List[str]) -> float:
-    """Simple keyword overlap score."""
-    content_tokens = set(tokenize(content)) - STOPWORDS
-    tag_tokens = set(t.lower() for tag in tags for t in tag.split("-"))
-    query_set = set(query_tokens) - STOPWORDS
-    if not query_set:
-        return 0.0
-    content_hits = len(query_set & content_tokens)
-    tag_hits = len(query_set & tag_tokens) * 2  # tags weighted higher
-    return (content_hits + tag_hits) / len(query_set)
-
-
 @app.post("/memories", response_model=MemoryOut)
-def ingest(memory: MemoryIn, _: str = Depends(verify_key)):
+def ingest(memory: MemoryIn, _=Depends(verify_key)):
     now = int(time.time())
     date = memory.date or datetime.utcnow().strftime("%Y-%m-%d")
-    conn = get_db()
-    cur = conn.execute(
-        """INSERT INTO memories (content, type, tags, entities, visibility, importance, source, date, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (memory.content, memory.type, json.dumps(memory.tags), json.dumps(memory.entities),
-         memory.visibility, memory.importance, memory.source, date, now, now)
-    )
-    conn.commit()
-    row = conn.execute("SELECT * FROM memories WHERE id = ?", (cur.lastrowid,)).fetchone()
-    conn.close()
-    return row_to_out(row)
+    emb = embed(memory.content)
 
+    with get_db() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("""
+            INSERT INTO memories
+              (content, type, tags, entities, visibility, importance, source, date, embedding, created_at, updated_at)
+            VALUES (%s, %s, %s::jsonb, %s::jsonb, %s, %s, %s, %s, %s::vector, %s, %s)
+            RETURNING *
+        """, (
+            memory.content, memory.type,
+            json.dumps(memory.tags), json.dumps(memory.entities),
+            memory.visibility, memory.importance, memory.source,
+            date, str(emb), now, now
+        ))
+        return row_to_out(cur.fetchone())
 
 @app.post("/search", response_model=List[SearchResult])
-def search(req: SearchRequest, _: str = Depends(verify_key)):
-    conn = get_db()
-
-    # Build filter conditions
-    filters = ["m.importance >= ?"]
-    params = [req.min_importance]
-    if req.type_filter:
-        filters.append("m.type = ?")
-        params.append(req.type_filter)
-    filter_sql = " AND ".join(filters)
-
+def search(req: SearchRequest, _=Depends(verify_key)):
     results = []
     seen_ids = set()
 
-    # 1. FTS5 full-text search
-    try:
-        fts_query = " OR ".join(f'"{w}"' for w in tokenize(req.query) if w not in STOPWORDS) or req.query
-        fts_rows = conn.execute(
-            f"""SELECT m.*, rank as fts_rank
-                FROM memories m
-                JOIN memories_fts f ON m.id = f.rowid
-                WHERE memories_fts MATCH ? AND {filter_sql}
-                ORDER BY rank
-                LIMIT ?""",
-            [fts_query] + params + [req.limit]
-        ).fetchall()
-        for row in fts_rows:
-            score = max(0.0, min(1.0, 1.0 / (1.0 + abs(row["fts_rank"]) * 0.01)))
-            results.append(SearchResult(memory=row_to_out(row), score=round(score, 4), match_type="fts"))
-            seen_ids.add(row["id"])
-    except Exception:
-        pass  # FTS query might fail on weird input, fall through to keyword
+    filters = ["importance >= %s"]
+    params = [req.min_importance]
+    if req.type_filter:
+        filters.append("type = %s")
+        params.append(req.type_filter)
+    where = " AND ".join(filters)
 
-    # 2. Keyword fallback — score all memories
-    if len(results) < req.limit:
-        query_tokens = tokenize(req.query)
-        all_rows = conn.execute(
-            f"SELECT * FROM memories m WHERE {filter_sql} ORDER BY importance DESC, created_at DESC LIMIT 200",
-            params
-        ).fetchall()
-        scored = []
-        for row in all_rows:
-            if row["id"] in seen_ids:
-                continue
-            score = keyword_score(query_tokens, row["content"], json.loads(row["tags"]))
-            if score > 0:
-                scored.append((score, row))
-        scored.sort(key=lambda x: x[0], reverse=True)
-        for score, row in scored[:req.limit - len(results)]:
-            results.append(SearchResult(memory=row_to_out(row), score=round(score, 4), match_type="keyword"))
+    with get_db() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
-    conn.close()
-    return results
+        # Semantic search via pgvector
+        if req.mode in ("semantic", "hybrid"):
+            emb = embed(req.query)
+            cur.execute(f"""
+                SELECT *, 1 - (embedding <=> %s::vector) AS score
+                FROM memories
+                WHERE {where}
+                ORDER BY embedding <=> %s::vector
+                LIMIT %s
+            """, [str(emb)] + params + [str(emb)] + [req.limit])
+            for row in cur.fetchall():
+                results.append(SearchResult(
+                    memory=row_to_out(row),
+                    score=round(float(row["score"]), 4),
+                    match_type="semantic"
+                ))
+                seen_ids.add(row["id"])
 
+        # Full-text search via PostgreSQL tsvector
+        if req.mode in ("fts", "hybrid"):
+            cur.execute(f"""
+                SELECT *, ts_rank(to_tsvector('english', content), plainto_tsquery('english', %s)) AS score
+                FROM memories
+                WHERE {where}
+                  AND to_tsvector('english', content) @@ plainto_tsquery('english', %s)
+                ORDER BY score DESC
+                LIMIT %s
+            """, [req.query] + params + [req.query, req.limit])
+            for row in cur.fetchall():
+                if row["id"] not in seen_ids:
+                    results.append(SearchResult(
+                        memory=row_to_out(row),
+                        score=round(float(row["score"]), 4),
+                        match_type="fts"
+                    ))
+                    seen_ids.add(row["id"])
+
+    results.sort(key=lambda r: r.score, reverse=True)
+    return results[:req.limit]
 
 @app.get("/memories", response_model=List[MemoryOut])
 def list_memories(
     visibility: Optional[str] = None,
     type: Optional[str] = None,
     limit: int = 50,
-    _: str = Depends(verify_key)
+    _=Depends(verify_key)
 ):
-    conn = get_db()
-    where = []
+    conditions = []
     params = []
     if visibility:
-        where.append("visibility = ?")
+        conditions.append("visibility = %s")
         params.append(visibility)
     if type:
-        where.append("type = ?")
+        conditions.append("type = %s")
         params.append(type)
-    where_clause = f"WHERE {' AND '.join(where)}" if where else ""
-    rows = conn.execute(
-        f"SELECT * FROM memories {where_clause} ORDER BY importance DESC, created_at DESC LIMIT ?",
-        params + [limit]
-    ).fetchall()
-    conn.close()
-    return [row_to_out(r) for r in rows]
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
 
+    with get_db() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(f"SELECT * FROM memories {where} ORDER BY importance DESC, created_at DESC LIMIT %s",
+                    params + [limit])
+        return [row_to_out(r) for r in cur.fetchall()]
 
 @app.get("/memories/{memory_id}", response_model=MemoryOut)
-def get_memory(memory_id: int, _: str = Depends(verify_key)):
-    conn = get_db()
-    row = conn.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
-    conn.close()
+def get_memory(memory_id: int, _=Depends(verify_key)):
+    with get_db() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("SELECT * FROM memories WHERE id = %s", (memory_id,))
+        row = cur.fetchone()
     if not row:
-        raise HTTPException(status_code=404, detail="Memory not found")
+        raise HTTPException(status_code=404, detail="Not found")
     return row_to_out(row)
-
 
 @app.delete("/memories/{memory_id}")
-def delete_memory(memory_id: int, _: str = Depends(verify_key)):
-    conn = get_db()
-    conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
-    conn.commit()
-    conn.close()
+def delete_memory(memory_id: int, _=Depends(verify_key)):
+    with get_db() as conn:
+        conn.cursor().execute("DELETE FROM memories WHERE id = %s", (memory_id,))
     return {"deleted": memory_id}
 
-
 @app.patch("/memories/{memory_id}", response_model=MemoryOut)
-def update_memory(memory_id: int, updates: dict, _: str = Depends(verify_key)):
+def update_memory(memory_id: int, updates: dict, _=Depends(verify_key)):
     allowed = {"content", "type", "tags", "entities", "visibility", "importance", "source"}
     now = int(time.time())
-    conn = get_db()
-    for field, value in updates.items():
-        if field not in allowed:
-            continue
-        if field in ("tags", "entities"):
-            value = json.dumps(value)
-        conn.execute(f"UPDATE memories SET {field} = ?, updated_at = ? WHERE id = ?", (value, now, memory_id))
-    conn.commit()
-    row = conn.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
-    conn.close()
+    with get_db() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        for field, value in updates.items():
+            if field not in allowed:
+                continue
+            if field in ("tags", "entities"):
+                cur.execute(f"UPDATE memories SET {field} = %s::jsonb, updated_at = %s WHERE id = %s",
+                            (json.dumps(value), now, memory_id))
+            else:
+                cur.execute(f"UPDATE memories SET {field} = %s, updated_at = %s WHERE id = %s",
+                            (value, now, memory_id))
+            if field == "content":
+                emb = embed(value)
+                cur.execute("UPDATE memories SET embedding = %s::vector WHERE id = %s",
+                            (str(emb), memory_id))
+        cur.execute("SELECT * FROM memories WHERE id = %s", (memory_id,))
+        row = cur.fetchone()
     if not row:
-        raise HTTPException(status_code=404, detail="Memory not found")
+        raise HTTPException(status_code=404, detail="Not found")
     return row_to_out(row)
 
-
 @app.get("/patterns")
-def patterns(_: str = Depends(verify_key)):
-    conn = get_db()
-    type_counts = conn.execute(
-        "SELECT type, COUNT(*) as count FROM memories GROUP BY type ORDER BY count DESC"
-    ).fetchall()
-    tag_rows = conn.execute("SELECT tags FROM memories").fetchall()
-    entity_rows = conn.execute("SELECT entities FROM memories").fetchall()
-    conn.close()
-
-    tag_counts: Counter = Counter()
-    for row in tag_rows:
-        tag_counts.update(json.loads(row["tags"]))
-
-    entity_counts: Counter = Counter()
-    for row in entity_rows:
-        entity_counts.update(json.loads(row["entities"]))
-
-    return {
-        "by_type": {r["type"]: r["count"] for r in type_counts},
-        "top_tags": dict(tag_counts.most_common(20)),
-        "top_entities": dict(entity_counts.most_common(10)),
-        "total": sum(r["count"] for r in type_counts),
-    }
-
+def patterns(_=Depends(verify_key)):
+    with get_db() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("SELECT type, COUNT(*) as count FROM memories GROUP BY type ORDER BY count DESC")
+        type_counts = {r["type"]: r["count"] for r in cur.fetchall()}
+        cur.execute("SELECT jsonb_array_elements_text(tags) as tag, COUNT(*) as count FROM memories GROUP BY tag ORDER BY count DESC LIMIT 20")
+        top_tags = {r["tag"]: r["count"] for r in cur.fetchall()}
+        cur.execute("SELECT COUNT(*) as total FROM memories")
+        total = cur.fetchone()["total"]
+    return {"by_type": type_counts, "top_tags": top_tags, "total": total}
 
 @app.get("/public", response_model=List[MemoryOut])
 def public_memories(type: Optional[str] = None, limit: int = 100):
-    """No auth — public memories only (opinions, insights I want to share)"""
-    conn = get_db()
-    where = ["visibility = 'public'"]
+    conditions = ["visibility = 'public'"]
     params = []
     if type:
-        where.append("type = ?")
+        conditions.append("type = %s")
         params.append(type)
-    rows = conn.execute(
-        f"SELECT * FROM memories WHERE {' AND '.join(where)} ORDER BY importance DESC, created_at DESC LIMIT ?",
-        params + [limit]
-    ).fetchall()
-    conn.close()
-    return [row_to_out(r) for r in rows]
-
+    with get_db() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(f"SELECT * FROM memories WHERE {' AND '.join(conditions)} ORDER BY importance DESC, created_at DESC LIMIT %s",
+                    params + [limit])
+        return [row_to_out(r) for r in cur.fetchall()]
 
 @app.get("/health")
 def health():
-    conn = get_db()
-    row = conn.execute("SELECT COUNT(*) as total, MAX(created_at) as last FROM memories").fetchone()
-    conn.close()
-    return {
-        "status": "ok",
-        "memories": row["total"],
-        "last_memory": row["last"],
-        "mode": "fts5+keyword",
-        "version": "2.0.0",
-    }
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*), MAX(created_at) FROM memories")
+        total, last = cur.fetchone()
+    return {"status": "ok", "memories": total, "last_memory": last,
+            "mode": "pgvector+fts", "version": "3.0.0"}
 
-
-# Static page
 try:
     app.mount("/static", StaticFiles(directory="/app/static"), name="static")
-
     @app.get("/", response_class=HTMLResponse)
     def public_page():
         with open("/app/static/index.html") as f:
@@ -381,4 +332,4 @@ try:
 except Exception:
     @app.get("/")
     def root():
-        return {"service": "Palkia Memory Service", "version": "2.0.0"}
+        return {"service": "Palkia Memory Service", "version": "3.0.0"}

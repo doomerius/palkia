@@ -1,0 +1,39 @@
+services:
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: palkia
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-palkia-mem-2026}
+      POSTGRES_DB: memory
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - memory-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U palkia -d memory"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8081:8081"
+    environment:
+      DATABASE_URL: postgresql://palkia:${POSTGRES_PASSWORD:-palkia-mem-2026}@postgres:5432/memory
+      MEMORY_API_KEY: ${MEMORY_API_KEY:-palkia-memory-2026}
+    networks:
+      - memory-net
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+networks:
+  memory-net:
+    driver: bridge
+
+volumes:
+  postgres-data:
